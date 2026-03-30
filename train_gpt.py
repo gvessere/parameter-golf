@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+COMPUTE_DTYPE: torch.dtype = torch.bfloat16
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -97,7 +99,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.to(COMPUTE_DTYPE)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -255,7 +257,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -729,7 +731,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, COMPUTE_DTYPE
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -757,6 +759,14 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
+
+    # bf16 requires Ampere+ (sm_80); fall back to fp16 + GradScaler on older GPUs (e.g. T4).
+    if torch.cuda.get_device_capability(device)[0] >= 8:
+        COMPUTE_DTYPE = torch.bfloat16
+        grad_scaler = torch.amp.GradScaler(enabled=False)
+    else:
+        COMPUTE_DTYPE = torch.float16
+        grad_scaler = torch.amp.GradScaler()
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -835,7 +845,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
+    ).to(device=device, dtype=COMPUTE_DTYPE)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -895,6 +905,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"compute_dtype:{COMPUTE_DTYPE} grad_scaler:{grad_scaler.is_enabled()} gpu:{torch.cuda.get_device_name(device)}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -937,6 +948,7 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        initial_scaler_state = grad_scaler.state_dict()
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -944,17 +956,21 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE, enabled=True):
                     warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
+                grad_scaler.scale(warmup_loss * grad_scale).backward()
             for opt in optimizers:
-                opt.step()
+                grad_scaler.unscale_(opt)
+            for opt in optimizers:
+                grad_scaler.step(opt)
+            grad_scaler.update()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        grad_scaler.load_state_dict(initial_scaler_state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
@@ -1012,10 +1028,10 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            grad_scaler.scale(loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1027,10 +1043,13 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        for opt in optimizers:
+            grad_scaler.unscale_(opt)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
-            opt.step()
+            grad_scaler.step(opt)
+        grad_scaler.update()
         zero_grad_all()
 
         step += 1
