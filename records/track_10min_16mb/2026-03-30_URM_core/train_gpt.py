@@ -763,11 +763,6 @@ class BottleneckBlock(nn.Module):
         if use_hyper_connections:
             self.hc_attn = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
             self.hc_mlp = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
-        else:
-            # Shape [1, 1, dim] avoids runtime broadcasting that breaks
-            # torch.compile backward when the same block is called multiple times.
-            self.attn_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
-            self.mlp_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.use_hyper_connections:
@@ -776,9 +771,8 @@ class BottleneckBlock(nn.Module):
             x = self.hc_mlp(x, lambda h: self.mlp(self.mlp_norm(h)))
             x = F.rms_norm(x, (x.size(-1),))
         else:
-            attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
-            x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
+            x = x + self.attn(self.attn_norm(x))
+            x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -859,7 +853,6 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    @torch.compiler.disable
     def _run_bottleneck(self, x: Tensor, encoder_output: Tensor) -> Tensor:
         """URM-style nested recurrent loop with truncated backpropagation."""
         h_cycles = self.bottleneck_h_cycles
@@ -1050,7 +1043,7 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)  # fullgraph=False needed for @torch.compiler.disable on _run_bottleneck
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
