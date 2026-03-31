@@ -776,10 +776,9 @@ class BottleneckBlock(nn.Module):
         return x
 
 
-@torch.compiler.disable
 def run_bottleneck(blocks: nn.ModuleList, x: Tensor, encoder_output: Tensor,
                    h_cycles: int, l_cycles: int) -> Tensor:
-    """URM-style nested recurrent loop. Standalone function so torch.compiler.disable is respected."""
+    """URM-style nested recurrent loop with truncated backpropagation."""
     if h_cycles > 1:
         with torch.no_grad():
             for _ in range(h_cycles - 1):
@@ -1041,7 +1040,10 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    if args.bottleneck_l_cycles <= 1:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
