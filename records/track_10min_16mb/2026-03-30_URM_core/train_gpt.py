@@ -1057,7 +1057,10 @@ def main() -> None:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
     else:
         compiled_model = base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if distributed and world_size > 1:
+        model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=(args.bottleneck_h_cycles > 1))
+    else:
+        model = compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
