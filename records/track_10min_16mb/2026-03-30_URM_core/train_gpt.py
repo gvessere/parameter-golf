@@ -859,6 +859,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    @torch.compiler.disable
     def _run_bottleneck(self, x: Tensor, encoder_output: Tensor) -> Tensor:
         """URM-style nested recurrent loop with truncated backpropagation."""
         h_cycles = self.bottleneck_h_cycles
@@ -1049,7 +1050,7 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)  # fullgraph=False needed for @torch.compiler.disable on _run_bottleneck
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
