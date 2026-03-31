@@ -763,6 +763,9 @@ class BottleneckBlock(nn.Module):
         if use_hyper_connections:
             self.hc_attn = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
             self.hc_mlp = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
+        else:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.use_hyper_connections:
@@ -771,8 +774,9 @@ class BottleneckBlock(nn.Module):
             x = self.hc_mlp(x, lambda h: self.mlp(self.mlp_norm(h)))
             x = F.rms_norm(x, (x.size(-1),))
         else:
-            x = x + self.attn(self.attn_norm(x))
-            x = x + self.mlp(self.mlp_norm(x))
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
