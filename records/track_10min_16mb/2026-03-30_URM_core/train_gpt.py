@@ -776,6 +776,24 @@ class BottleneckBlock(nn.Module):
         return x
 
 
+@torch.compiler.disable
+def run_bottleneck(blocks: nn.ModuleList, x: Tensor, encoder_output: Tensor,
+                   h_cycles: int, l_cycles: int) -> Tensor:
+    """URM-style nested recurrent loop. Standalone function so torch.compiler.disable is respected."""
+    if h_cycles > 1:
+        with torch.no_grad():
+            for _ in range(h_cycles - 1):
+                for _ in range(l_cycles):
+                    x = x + encoder_output
+                    for block in blocks:
+                        x = block(x)
+    for _ in range(l_cycles):
+        x = x + encoder_output
+        for block in blocks:
+            x = block(x)
+    return x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -853,27 +871,6 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _run_bottleneck(self, x: Tensor, encoder_output: Tensor) -> Tensor:
-        """URM-style nested recurrent loop with truncated backpropagation."""
-        h_cycles = self.bottleneck_h_cycles
-        l_cycles = self.bottleneck_l_cycles
-
-        # Truncated backprop: first H-1 macro-cycles under no_grad
-        if h_cycles > 1:
-            with torch.no_grad():
-                for _ in range(h_cycles - 1):
-                    for _ in range(l_cycles):
-                        x = x + encoder_output
-                        for block in self.bottleneck:
-                            x = block(x)
-
-        # Final macro-cycle with gradients
-        for _ in range(l_cycles):
-            x = x + encoder_output
-            for block in self.bottleneck:
-                x = block(x)
-        return x
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -885,7 +882,8 @@ class GPT(nn.Module):
             skips.append(x)
 
         # URM recurrent bottleneck between encoder and decoder
-        x = self._run_bottleneck(x, encoder_output=x)
+        x = run_bottleneck(self.bottleneck, x, x,
+                           self.bottleneck_h_cycles, self.bottleneck_l_cycles)
 
         for i in range(self.num_decoder_layers):
             if skips:
@@ -1043,7 +1041,7 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
