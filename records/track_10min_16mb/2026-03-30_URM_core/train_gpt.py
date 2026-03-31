@@ -643,16 +643,20 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Keep residual/vector scales in explicit [1, 1, D] shape to avoid
+        # TorchInductor backward shape mismatches under fullgraph compile.
+        self.attn_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+        self.resid_mix = nn.Parameter(
+            torch.stack((torch.ones((1, 1, dim)), torch.zeros((1, 1, dim)))).float()
+        )
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -764,8 +768,8 @@ class BottleneckBlock(nn.Module):
             self.hc_attn = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
             self.hc_mlp = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
         else:
-            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.attn_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.use_hyper_connections:
@@ -775,8 +779,8 @@ class BottleneckBlock(nn.Module):
             x = F.rms_norm(x, (x.size(-1),))
         else:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
