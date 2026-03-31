@@ -1039,7 +1039,14 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, nn.Conv1d, nn.LayerNorm)):
             module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    if grad_scaler.is_enabled():
+        # T4/fp16: GradScaler requires all gradients to be fp32.
+        # Force every parameter to fp32; autocast handles fp16 compute.
+        for p in base_model.parameters():
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
+    else:
+        restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
