@@ -1037,7 +1037,7 @@ def main() -> None:
         hyper_num_streams=args.hyper_num_streams,
     ).to(device=device, dtype=COMPUTE_DTYPE)
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, nn.Conv1d, nn.LayerNorm)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
