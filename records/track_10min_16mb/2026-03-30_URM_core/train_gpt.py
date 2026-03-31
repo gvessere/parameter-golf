@@ -88,6 +88,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Torch compile controls.
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
+
     # URM recurrent bottleneck (inserted between encoder and decoder halves).
     bottleneck_blocks = int(os.environ.get("BOTTLENECK_BLOCKS", 1))
     bottleneck_h_cycles = int(os.environ.get("BOTTLENECK_H_CYCLES", 1))
@@ -643,16 +647,20 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Keep residual/vector scales in explicit [1, 1, D] shape to avoid
+        # TorchInductor backward shape mismatches under fullgraph compile.
+        self.attn_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+        self.resid_mix = nn.Parameter(
+            torch.stack((torch.ones((1, 1, dim)), torch.zeros((1, 1, dim)))).float()
+        )
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -764,8 +772,8 @@ class BottleneckBlock(nn.Module):
             self.hc_attn = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
             self.hc_mlp = CayleyOrthogonalHyperConnection(dim, num_streams=hyper_num_streams)
         else:
-            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.attn_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones((1, 1, dim), dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.use_hyper_connections:
@@ -775,8 +783,8 @@ class BottleneckBlock(nn.Module):
             x = F.rms_norm(x, (x.size(-1),))
         else:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -1044,8 +1052,12 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    if args.bottleneck_l_cycles <= 1:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    should_compile_model = args.compile_model and args.bottleneck_l_cycles <= 1
+    if should_compile_model and grad_scaler.is_enabled():
+        log0("compile_model:disabled reason=grad_scaler_enabled")
+        should_compile_model = False
+    if should_compile_model:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
     else:
         compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
