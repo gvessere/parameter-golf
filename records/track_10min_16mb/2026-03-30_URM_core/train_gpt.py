@@ -88,6 +88,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Torch compile controls.
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
+
     # URM recurrent bottleneck (inserted between encoder and decoder halves).
     bottleneck_blocks = int(os.environ.get("BOTTLENECK_BLOCKS", 1))
     bottleneck_h_cycles = int(os.environ.get("BOTTLENECK_H_CYCLES", 1))
@@ -1048,8 +1052,12 @@ def main() -> None:
                 p.data = p.data.float()
     else:
         restore_low_dim_params_to_fp32(base_model)
-    if args.bottleneck_l_cycles <= 1:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    should_compile_model = args.compile_model and args.bottleneck_l_cycles <= 1
+    if should_compile_model and grad_scaler.is_enabled():
+        log0("compile_model:disabled reason=grad_scaler_enabled")
+        should_compile_model = False
+    if should_compile_model:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
     else:
         compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
