@@ -592,7 +592,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype).view(1, self.num_heads, 1, 1)
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -640,10 +640,14 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        mix_main = mix[0].view(1, 1, -1)
+        mix_skip = mix[1].view(1, 1, -1)
+        x = mix_main * x + mix_skip * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_scale = self.attn_scale.to(dtype=x.dtype).view(1, 1, -1)
+        mlp_scale = self.mlp_scale.to(dtype=x.dtype).view(1, 1, -1)
+        x = x + attn_scale * attn_out
+        x = x + mlp_scale * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -711,7 +715,8 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip_scale = self.skip_weights[i].to(dtype=x.dtype).view(1, 1, -1)
+                x = x + skip_scale * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
