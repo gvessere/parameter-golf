@@ -955,10 +955,11 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
+    is_turing_or_older = torch.cuda.get_device_capability(device)[0] < 8
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(is_turing_or_older)
+    enable_math_sdp(is_turing_or_older)
 
     logfile = None
     if master_process:
