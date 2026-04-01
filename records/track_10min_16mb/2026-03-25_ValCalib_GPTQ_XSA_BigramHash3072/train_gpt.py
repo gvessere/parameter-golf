@@ -660,9 +660,12 @@ class CausalSelfAttention(nn.Module):
 
         if self.num_kv_heads != self.num_heads:
             rep = self.num_heads // self.num_kv_heads
-            k = k[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-            v = v[:, :, None, :, :].expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+            k = k[:, :, :, None, :].expand(-1, -1, -1, rep, -1).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            v = v[:, :, :, None, :].expand(-1, -1, -1, rep, -1).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attn_mask=None, is_causal=True,
+        ).transpose(1, 2)
         
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
