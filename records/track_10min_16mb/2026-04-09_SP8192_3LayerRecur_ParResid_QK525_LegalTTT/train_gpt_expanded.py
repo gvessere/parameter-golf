@@ -487,9 +487,8 @@ class AdaptiveRotationHyperConnection(nn.Module):
         # Learnable output scale s (Eq 42); init=1 → standard residual at init
         self.s = nn.Parameter(torch.ones(1))
 
-        # Givens rotation pairs (i < j)
-        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-        self.register_buffer('_pairs', torch.tensor(pairs, dtype=torch.long), persistent=False)
+        # Givens rotation pairs (i < j) — plain Python list so torch.compile sees static indices
+        self._pairs: list[tuple[int, int]] = [(i, j) for i in range(n) for j in range(i + 1, n)]
 
     def _apply_rotations(self, streams: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
         """Apply Givens rotations in sequence directly to stream vectors (Eq 43 / H_res).
@@ -508,9 +507,7 @@ class AdaptiveRotationHyperConnection(nn.Module):
         s = torch.sin(angles)
         # Unbind along the stream dim — list replacement is autograd-safe.
         vecs = list(streams.unbind(dim=-2))
-        for k in range(self._pairs.shape[0]):
-            i_idx = self._pairs[k, 0].item()
-            j_idx = self._pairs[k, 1].item()
+        for k, (i_idx, j_idx) in enumerate(self._pairs):
             ck = c[..., k:k+1]   # [B, T, 1] broadcasts over D
             sk = s[..., k:k+1]
             vi, vj = vecs[i_idx], vecs[j_idx]
@@ -1460,6 +1457,12 @@ def train_model(h, device, val_data):
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+                # Keep HC params in the gradient graph when looping is inactive,
+                # so DDP doesn't complain about unused parameters.
+                if not base_model.looping_active and base_model.hc_modules:
+                    loss = loss + sum(
+                        0.0 * p.sum() for p in base_model.hc_modules.parameters()
+                    )
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
