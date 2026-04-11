@@ -1427,7 +1427,7 @@ def train_model(h, device, val_data):
     restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
-        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False, find_unused_parameters=True)
     else:
         model = compiled_model
 
