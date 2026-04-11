@@ -652,9 +652,9 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.)
 
     def _apply_block(self, i, x, x0, streams_state):
-        """Call block i, using HC multi-stream update when looping and block is in the loop seg."""
+        """Call block i, using HC multi-stream update when block is in the loop seg."""
         key = str(i)
-        if self.looping_active and key in self._hc_keys:
+        if key in self._hc_keys:
             n = self.hc_num_streams
             if key not in streams_state:
                 # Lazy init: replicate current x across all streams
@@ -1424,7 +1424,7 @@ def train_model(h, device, val_data):
     restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
-        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False, find_unused_parameters=True)
+        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
     else:
         model = compiled_model
 
@@ -1457,12 +1457,6 @@ def train_model(h, device, val_data):
             x, y = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-                # Keep HC params in the gradient graph when looping is inactive,
-                # so DDP doesn't complain about unused parameters.
-                if not base_model.looping_active and base_model.hc_modules:
-                    loss = loss + sum(
-                        0.0 * p.sum() for p in base_model.hc_modules.parameters()
-                    )
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
