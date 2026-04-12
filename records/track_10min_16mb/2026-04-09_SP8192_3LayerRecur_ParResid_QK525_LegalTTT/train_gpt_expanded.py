@@ -528,8 +528,8 @@ class AdaptiveRotationHyperConnection(nn.Module):
         B, T, n, D = streams.shape
 
         # LayerNorm on the full flattened stream state (Eq 35)
-        xflat = streams.flatten(-2, -1).float()   # [B, T, n*D]
-        normed = self.norm(xflat)                 # [B, T, n*D]
+        xflat = streams.flatten(-2, -1).float()        # [B, T, n*D]
+        normed = self.norm(xflat).to(streams.dtype)    # [B, T, n*D], cast back for weight matmuls
 
         # H_pre: row-stochastic n×n — aggregates streams into one input (Eq 36, 39)
         h_pre = F.softmax(
