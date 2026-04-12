@@ -467,6 +467,8 @@ class AdaptiveRotationHyperConnection(nn.Module):
 
     def __init__(self, hidden_size: int, num_streams: int = 4, tau: float = 1.0):
         super().__init__()
+        if num_streams < 1:
+            raise ValueError(f"num_streams must be >= 1, got {num_streams}. Set HC_NUM_STREAMS=0 to disable HC entirely.")
         n = self.num_streams = num_streams
         self.hidden_size = hidden_size
         self.tau = tau
@@ -617,9 +619,10 @@ class GPT(nn.Module):
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
 
-        # Hyper-connections for repeated (looped) blocks only
+        # Hyper-connections for repeated (looped) blocks only.
+        # Set HC_NUM_STREAMS=0 to disable and use plain residual connections.
         self.hc_num_streams = getattr(h, 'hc_num_streams', 4)
-        if h.num_loops > 0:
+        if h.num_loops > 0 and self.hc_num_streams > 0:
             self._hc_keys = {str(i) for i in range(h.loop_start, h.loop_end + 1)}
             self.hc_modules = nn.ModuleDict({
                 k: AdaptiveRotationHyperConnection(h.model_dim, num_streams=self.hc_num_streams)
