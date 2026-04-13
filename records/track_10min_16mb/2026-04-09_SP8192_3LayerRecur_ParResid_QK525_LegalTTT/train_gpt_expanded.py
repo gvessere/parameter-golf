@@ -91,6 +91,7 @@ class Hyperparameters:
     etlb_steps = int(os.environ.get('ETLB_STEPS', 5))
     etlb_clip = float(os.environ.get('ETLB_CLIP', 3.))
     hc_num_streams = int(os.environ.get('HC_NUM_STREAMS', 4))
+    hc_skip_streams = int(os.environ.get('HC_SKIP_STREAMS', 2))
     compressor = os.environ.get('COMPRESSOR', 'brotli')
     gptq_calibration_batches = int(os.environ.get('GPTQ_CALIBRATION_BATCHES', 64))
     gptq_reserve_seconds = float(os.environ.get('GPTQ_RESERVE_SECONDS', 12.))
@@ -468,7 +469,7 @@ class AdaptiveRotationHyperConnection(nn.Module):
     def __init__(self, hidden_size: int, num_streams: int = 4, tau: float = 1.0):
         super().__init__()
         if num_streams < 1:
-            raise ValueError(f"num_streams must be >= 1, got {num_streams}. Set HC_NUM_STREAMS=0 to disable HC entirely.")
+            raise ValueError(f"num_streams must be >= 1, got {num_streams}. Use HC_NUM_STREAMS=0 or HC_SKIP_STREAMS=0 to disable.")
         n = self.num_streams = num_streams
         self.hidden_size = hidden_size
         self.tau = tau
@@ -620,7 +621,7 @@ class GPT(nn.Module):
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
 
         # Hyper-connections for repeated (looped) blocks only.
-        # Set HC_NUM_STREAMS=0 to disable and use plain residual connections.
+        # Set HC_NUM_STREAMS=0 to disable loop-block HC.
         self.hc_num_streams = getattr(h, 'hc_num_streams', 4)
         if h.num_loops > 0 and self.hc_num_streams > 0:
             self._hc_keys = {str(i) for i in range(h.loop_start, h.loop_end + 1)}
@@ -632,14 +633,16 @@ class GPT(nn.Module):
             self._hc_keys = set()
             self.hc_modules = nn.ModuleDict()
 
+        # Hyper-connections for encoder-decoder skip connections.
+        # Set HC_SKIP_STREAMS=0 to disable skip HC and use plain skip_weights/skip_gates.
+        self.hc_skip_streams = getattr(h, 'hc_skip_streams', 2)
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
-        if self.hc_num_streams > 0:
-            # Skip connections become hyper-connections: 2 streams (current x + encoder skip).
+        if self.hc_skip_streams > 0:
             # At init (zero weights) this recovers plain additive skip: output = x + skip.
             self.skip_weights = None
             self.skip_gates = None
             self.hc_skip_modules = nn.ModuleDict({
-                str(i): AdaptiveRotationHyperConnection(h.model_dim, num_streams=2)
+                str(i): AdaptiveRotationHyperConnection(h.model_dim, num_streams=self.hc_skip_streams)
                 for i in range(self.num_skip_weights)
             })
         else:
