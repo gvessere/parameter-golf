@@ -1450,7 +1450,7 @@ def train_model(h, device, val_data):
     if h.distributed:
         # Compile after DDP (PyTorch-recommended order): DDP hooks are part of the
         # compiled graph, so all parameters are always visible to the autograd engine.
-        model = DDP(base_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        model = DDP(base_model, device_ids=[h.local_rank], broadcast_buffers=False, find_unused_parameters=True)
         compiled_model = torch.compile(model, dynamic=False, fullgraph=True)
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
