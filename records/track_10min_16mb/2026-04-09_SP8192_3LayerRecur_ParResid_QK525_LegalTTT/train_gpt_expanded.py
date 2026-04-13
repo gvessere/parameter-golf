@@ -633,12 +633,23 @@ class GPT(nn.Module):
             self.hc_modules = nn.ModuleDict()
 
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
-        self.skip_weights = nn.Parameter(
-            torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
-        )
-        self.skip_gates = nn.Parameter(
-            torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
-        ) if h.skip_gates_enabled else None
+        if self.hc_num_streams > 0:
+            # Skip connections become hyper-connections: 2 streams (current x + encoder skip).
+            # At init (zero weights) this recovers plain additive skip: output = x + skip.
+            self.skip_weights = None
+            self.skip_gates = None
+            self.hc_skip_modules = nn.ModuleDict({
+                str(i): AdaptiveRotationHyperConnection(h.model_dim, num_streams=2)
+                for i in range(self.num_skip_weights)
+            })
+        else:
+            self.skip_weights = nn.Parameter(
+                torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
+            )
+            self.skip_gates = nn.Parameter(
+                torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
+            ) if h.skip_gates_enabled else None
+            self.hc_skip_modules = nn.ModuleDict()
 
         self._init_weights()
 
@@ -689,13 +700,18 @@ class GPT(nn.Module):
 
         for (skip_idx, i) in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
-                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
+                skip = skips.pop()
+                if self.hc_skip_modules:
+                    # HC skip: 2-stream hyper-connection merging current x and encoder skip.
+                    # sublayer is identity — HC only learns how to mix the two streams.
+                    streams_2 = torch.stack([x, skip], dim=2)  # [B, T, 2, D]
+                    x = self.hc_skip_modules[str(skip_idx)](streams_2, lambda v: v).mean(dim=2)
+                elif self.skip_gates is not None:
+                    scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
                     g = torch.sigmoid(
                         self.skip_gates[skip_idx].to(dtype=x.dtype)
                     )[None, None, :]
                     x = torch.lerp(scaled_skip, x, g)
-                    # Propagate gated skip into existing streams for this block
                     key = str(i)
                     if self.looping_active and key in streams_state:
                         streams_state[key] = torch.lerp(
@@ -703,8 +719,8 @@ class GPT(nn.Module):
                             streams_state[key], g.unsqueeze(2),
                         )
                 else:
+                    scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
                     x = x + scaled_skip
-                    # Propagate additive skip into existing streams for this block
                     key = str(i)
                     if self.looping_active and key in streams_state:
                         streams_state[key] = streams_state[key] + scaled_skip.unsqueeze(2)
@@ -829,7 +845,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 class Optimizers:
     def __init__(self, h, base_model):
         block_named_params = list(base_model.blocks.named_parameters())
-        hc_named_params = list(base_model.hc_modules.named_parameters())
+        hc_named_params = (
+            list(base_model.hc_modules.named_parameters())
+            + list(base_model.hc_skip_modules.named_parameters())
+        )
         all_block_named_params = block_named_params + hc_named_params
         matrix_params = [
             p for (name, p) in all_block_named_params
@@ -844,7 +863,7 @@ class Optimizers:
             )
         ]
 
-        if base_model.skip_weights.numel() > 0:
+        if base_model.skip_weights is not None and base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
