@@ -1447,10 +1447,13 @@ def timed_eval(label, fn, *args, **kwargs):
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
-        model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        # Compile after DDP (PyTorch-recommended order): DDP hooks are part of the
+        # compiled graph, so all parameters are always visible to the autograd engine.
+        model = DDP(base_model, device_ids=[h.local_rank], broadcast_buffers=False)
+        compiled_model = torch.compile(model, dynamic=False, fullgraph=True)
     else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
         model = compiled_model
 
     log(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
