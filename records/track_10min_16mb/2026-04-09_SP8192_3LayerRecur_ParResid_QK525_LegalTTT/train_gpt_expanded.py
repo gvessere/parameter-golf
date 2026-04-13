@@ -619,11 +619,11 @@ class GPT(nn.Module):
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
 
-        # Hyper-connections on transformer blocks.
+        # Hyper-connections for repeated (looped) blocks only.
         # Set HC_NUM_STREAMS=0 to disable and use plain residual connections.
         self.hc_num_streams = getattr(h, 'hc_num_streams', 4)
-        if self.hc_num_streams > 0:
-            self._hc_keys = {str(i) for i in range(h.num_layers)}
+        if h.num_loops > 0 and self.hc_num_streams > 0:
+            self._hc_keys = {str(i) for i in range(h.loop_start, h.loop_end + 1)}
             self.hc_modules = nn.ModuleDict({
                 k: AdaptiveRotationHyperConnection(h.model_dim, num_streams=self.hc_num_streams)
                 for k in self._hc_keys
