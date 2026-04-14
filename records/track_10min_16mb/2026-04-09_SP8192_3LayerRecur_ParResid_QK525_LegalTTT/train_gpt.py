@@ -159,11 +159,11 @@ class GPT(nn.Module):
 		return self.logit_softcap*torch.tanh(logits_proj/self.logit_softcap)
 	def forward(self,input_ids,target_ids):
 		logits=self.forward_logits(input_ids);V=logits.size(-1);flat=logits.reshape(-1,V).float();ce1=F.cross_entropy(flat,target_ids.reshape(-1),reduction='mean')
-		if self.multi_step_weight<=0. or self.multi_step_k<2:return ce1
+		if not self.training or self.multi_step_weight<=0. or self.multi_step_k<2:return ce1
 		aux=ce1.new_zeros(())
 		for k in range(2,self.multi_step_k+1):
 			wk=self.multi_step_weight*(self.multi_step_decay**(k-2));aux=aux+wk*F.cross_entropy(logits[:,:-k+1].reshape(-1,V).float(),target_ids[:,k-1:].reshape(-1),reduction='mean')
-		return ce1+aux
+		return ce1+aux,ce1
 def classify_param(name):
 	if'tok_emb'in name or'lm_head'in name:return'embed'
 	if'.mlp.'in name:return'mlp'
@@ -396,18 +396,20 @@ def train_model(h,device,val_data):
 		if frac>=1.-h.warmdown_frac:return max((1.-frac)/h.warmdown_frac,h.min_lr)
 		return 1.
 	def step_fn(step,lr_scale):
-		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device)
+		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device);train_ce1=torch.zeros((),device=device)
 		for micro_step in range(h.grad_accum_steps):
 			if h.distributed:model.require_backward_grad_sync=micro_step==h.grad_accum_steps-1
 			x,y=train_loader.next_batch(h.train_batch_tokens,h.grad_accum_steps)
-			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
-			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
-		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):out=model(x,y)
+			if isinstance(out,tuple):loss,ce1=out
+			else:loss,ce1=out,out
+			train_loss+=loss.detach();train_ce1+=ce1.detach();(loss/h.grad_accum_steps).backward()
+		train_loss/=h.grad_accum_steps;train_ce1/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
 		for group in optimizers.optimizer_muon.param_groups:group['momentum']=muon_momentum
 		for opt in optimizers:
 			for group in opt.param_groups:group['lr']=group['base_lr']*lr_scale
 		if h.grad_clip_norm>0:torch.nn.utils.clip_grad_norm_(base_model.parameters(),h.grad_clip_norm)
-		optimizers.step();return train_loss
+		optimizers.step();return train_loss,train_ce1
 	if h.warmup_steps>0:
 		initial_model_state={name:tensor.detach().cpu().clone()for(name,tensor)in base_model.state_dict().items()};initial_optimizer_states=[copy.deepcopy(opt.state_dict())for opt in optimizers];model.train()
 		for warmup_step in range(h.warmup_steps):
@@ -433,11 +435,11 @@ def train_model(h,device,val_data):
 			break
 		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac)
 		if h.num_loops>0 and not base_model.looping_active and frac>=h.enable_looping_at:base_model.looping_active=True;log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
-		train_loss=step_fn(step,scale)
+		train_loss,train_ce1=step_fn(step,scale)
 		with torch.no_grad():
 			for(name,t)in base_model.state_dict().items():ema_state[name].mul_(ema_decay).add_(t.detach().float(),alpha=1.-ema_decay)
 		step+=1;approx_training_time_ms=training_time_ms+1e3*(time.perf_counter()-t0);should_log_train=h.train_log_every>0 and(step<=5 or step%h.train_log_every==0 or stop_after_step is not None)
-		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}")
+		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);ce1_str=f" train_ce1: {train_ce1.item():.4f}" if h.multi_step_weight>0. else "";log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f}{ce1_str} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}")
 		reached_cap=max_wallclock_ms is not None and approx_training_time_ms>=max_wallclock_ms
 		if h.distributed and max_wallclock_ms is not None:reached_cap_tensor=torch.tensor(int(reached_cap),device=device);dist.all_reduce(reached_cap_tensor,op=dist.ReduceOp.MAX);reached_cap=bool(reached_cap_tensor.item())
 		if stop_after_step is None and reached_cap:stop_after_step=step
