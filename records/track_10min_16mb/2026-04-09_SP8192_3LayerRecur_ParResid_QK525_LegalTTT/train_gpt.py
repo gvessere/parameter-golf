@@ -158,7 +158,11 @@ class GPT(nn.Module):
 		else:logits_proj=self.lm_head(x)
 		return self.logit_softcap*torch.tanh(logits_proj/self.logit_softcap)
 	def forward(self,input_ids,target_ids):
-		if self.training and self.token_dropout_rate>0.:input_ids=input_ids.masked_fill(torch.rand_like(input_ids,dtype=torch.float32)<self.token_dropout_rate,0)
+		if self.training and self.token_dropout_rate>0.:
+			apply=torch.rand(input_ids.shape[0],input_ids.shape[1],device=input_ids.device,dtype=torch.float32)<self.token_dropout_rate
+			mask=torch.zeros_like(apply,dtype=torch.bool)
+			for offset in range(1,self.multi_step_k+1):mask=mask|F.pad(apply[:,offset:],(0,offset),value=False)
+			input_ids=input_ids.masked_fill(mask,0)
 		logits=self.forward_logits(input_ids);V=logits.size(-1);flat=logits.reshape(-1,V).float();ce1=F.cross_entropy(flat,target_ids.reshape(-1),reduction='mean')
 		if not self.training or self.multi_step_weight<=0. or self.multi_step_k<2:return ce1
 		aux=ce1.new_zeros(())
