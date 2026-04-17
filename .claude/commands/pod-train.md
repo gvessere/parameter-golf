@@ -2,7 +2,15 @@ Execute the parameter-golf training script on the RunPod pod in a tmux session.
 
 Arguments: `$ARGUMENTS` should contain `host port` (e.g. `213.173.108.12 19020`). If not provided, query the RunPod API for the running pod's SSH details.
 
-Kill any existing tmux 'train' session, then start a new one with:
+Kill any existing tmux 'train' session, then run these steps before starting training:
+
+```
+cd /workspace/parameter-golf
+git pull
+cp records/track_10min_16mb/2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT/* /workspace/parameter-golf/
+```
+
+Then start the training session:
 
 ```
 cd /workspace/parameter-golf
