@@ -22,14 +22,16 @@ Steps:
    - key hyperparameters (grep the hyperparams block from train.log)
 
 5. Determine the baseline for comparison:
-   - Check if experiments/baseline points to an existing experiment directory (contains the path to the baseline)
-   - If no baseline file exists, list available experiments and ask the user which to use as baseline (or confirm there is none)
-   - Extract the baseline's final val loss from its train.log
+   - Primary baseline: experiments/baseline_8gpu/meta.md — mean pre-quant val_loss: 2.80955, mean quantized+TTT val_loss: 2.79234. CAVEAT: these were 8-GPU runs with larger batch size, so they have an advantage. A single-GPU run matching or beating them is a strong result.
+   - Secondary baseline: check if experiments/baseline points to a more recent single-GPU experiment to use as a closer comparison. If it exists, use that val_loss instead (or in addition).
+   - Extract the current run's final val_loss from the last "pre-quantization post-ema val_loss:" line in train.log. If training didn't finish, use the last "val_loss:" line.
 
 6. Write a conclusion in meta.md:
-   - If no baseline: "No baseline available for comparison."
-   - If baseline exists: state which experiment is the baseline, its val loss, the delta (e.g. "+0.012 worse" or "-0.008 better"), and a one-line verdict: "better", "worse", or "close" (within 0.005 = close)
+   - Compare to 8-GPU baseline mean (2.80955 pre-quant) and note the caveat
+   - If secondary single-GPU baseline exists, compare to that too
+   - Compute delta and verdict: "better" (delta < -0.002), "worse" (delta > +0.002), or "close" (within ±0.002)
+   - One-line summary e.g.: "worse by 0.008 vs 8-GPU baseline (expected given 1 GPU); close to single-GPU baseline"
 
 7. Print a summary: directory created, final val loss, comparison to baseline, git hash.
 
-8. Offer to commit the new experiment directory to git. Also ask if this run should become the new baseline (updates experiments/baseline).
+8. Offer to commit the new experiment directory to git. Also ask if this run should become the new single-GPU baseline (updates experiments/baseline file with the path).
