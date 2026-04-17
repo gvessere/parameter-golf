@@ -142,32 +142,33 @@ class GPT(nn.Module):
 				if getattr(module,'_zero_init',False):nn.init.zeros_(module.weight)
 				elif module.weight.ndim==2 and module.weight.shape[0]>=64 and module.weight.shape[1]>=64:nn.init.orthogonal_(module.weight,gain=1.)
 	def _doc_contrastive_loss(self,x,input_ids):
-		# x: [B,T,D] hidden states; input_ids: [B,T]
-		# View 1: hidden state at each BOS token (document start)
+		# x: [B,T,D] hidden states (post-transformer, fully contextualized); input_ids: [B,T]
+		# View 1: last hidden state of each doc (position just before next BOS, or T-1)
+		#         = fully contextualized over the entire document
 		# View 2: mean hidden state over all tokens of that document
-		# InfoNCE across all docs in the full batch
+		# InfoNCE across all docs in the full batch (within + across sequences)
 		B,T,D=x.shape;M=self.contrastive_max_docs;x_f=x.float()
 		bos_mask=(input_ids==self.contrastive_bos_id).float()  # [B,T]
 		doc_idx=(bos_mask.cumsum(dim=1)-1).long().clamp(0,M-1)  # [B,T]
 		idx_exp=doc_idx.unsqueeze(-1).expand(-1,-1,D)  # [B,T,D]
-		# View 1: scatter BOS hidden states (exactly 1 BOS per doc, so sum == BOS hidden state)
-		v1=torch.zeros(B,M,D,device=x.device,dtype=torch.float32).scatter_add_(1,idx_exp,x_f*bos_mask.unsqueeze(-1))
-		# View 2: scatter mean over all doc tokens
-		v2=torch.zeros(B,M,D,device=x.device,dtype=torch.float32).scatter_add_(1,idx_exp,x_f)
+		# End-of-doc mask: 1 at the last token of each doc (token just before next BOS, or T-1)
+		end_mask=torch.cat([bos_mask[:,1:],bos_mask.new_ones(B,1)],dim=1)  # [B,T]
+		# View 1: last hidden state per doc (exactly 1 end per doc -> scatter sum == that state)
+		v1=torch.zeros(B,M,D,device=x.device,dtype=torch.float32).scatter_add_(1,idx_exp,x_f*end_mask.unsqueeze(-1))
+		# View 2: mean hidden state over all doc tokens
 		counts=torch.zeros(B,M,device=x.device,dtype=torch.float32).scatter_add_(1,doc_idx,torch.ones(B,T,device=x.device,dtype=torch.float32))
+		v2=torch.zeros(B,M,D,device=x.device,dtype=torch.float32).scatter_add_(1,idx_exp,x_f)
 		v2=v2/(counts.unsqueeze(-1)+1e-8)
 		# Valid mask: doc must have at least 1 BOS token
 		bos_counts=torch.zeros(B,M,device=x.device,dtype=torch.float32).scatter_add_(1,doc_idx,bos_mask)
-		valid=(bos_counts>0.5).reshape(B*M)  # [B*M]
-		# Flatten to [B*M, D] and normalize
+		valid=(bos_counts>0.5).reshape(B*M)
+		# Flatten and L2-normalize
 		v1=F.normalize(v1.reshape(B*M,D),dim=-1)
 		v2=F.normalize(v2.reshape(B*M,D),dim=-1)
 		# InfoNCE: [B*M, B*M] similarity; positive = diagonal
 		sim=(v1@v2.T)/self.contrastive_temp
 		labels=torch.arange(B*M,device=x.device)
-		# Mask invalid rows/cols to large negative so they don't affect softmax
 		inv=~valid;sim=sim.masked_fill(inv.unsqueeze(0),-1e9).masked_fill(inv.unsqueeze(1),-1e9)
-		# Compute cross-entropy for valid rows only (mask via weight=0 for invalid)
 		ce_fwd=F.cross_entropy(sim,labels,reduction='none')*valid.float()
 		ce_bwd=F.cross_entropy(sim.T,labels,reduction='none')*valid.float()
 		n_valid=valid.float().sum().clamp(min=1)
