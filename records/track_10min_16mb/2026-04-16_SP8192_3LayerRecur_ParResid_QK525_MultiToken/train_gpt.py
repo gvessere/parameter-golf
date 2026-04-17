@@ -161,12 +161,12 @@ class GPT(nn.Module):
 		return self.logit_softcap*torch.tanh(logits_proj/self.logit_softcap)
 	def forward(self,input_ids,target_ids):
 		if not self.training or self.mtp_horizons==0:
-			logits=self.forward_logits(input_ids);return F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),target_ids.reshape(-1),reduction='mean')
+			logits=self.forward_logits(input_ids);ar_loss=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),target_ids.reshape(-1),reduction='mean');return ar_loss,ar_loss
 		x=self._forward_hidden(input_ids);B,T,D=x.shape;V=self.tok_emb.weight.size(0)
 		x_ar=self.final_norm(x)
 		if self.head_proj is not None:x_ar=self.head_proj(x_ar)
 		ar_logits=self.logit_softcap*torch.tanh((F.linear(x_ar,self.tok_emb.weight)if self.tie_embeddings else self.lm_head(x_ar))/self.logit_softcap)
-		loss=F.cross_entropy(ar_logits.reshape(-1,V).float(),target_ids.reshape(-1),reduction='mean')
+		ar_loss=F.cross_entropy(ar_logits.reshape(-1,V).float(),target_ids.reshape(-1),reduction='mean');loss=ar_loss
 		causal_mask=torch.triu(torch.ones(T,T,device=x.device,dtype=torch.bool),1)
 		for k in range(self.mtp_horizons):
 			step=k+2
@@ -180,7 +180,7 @@ class GPT(nn.Module):
 			lk=self.logit_softcap*torch.tanh((F.linear(x_k,self.tok_emb.weight)if self.tie_embeddings else self.lm_head(x_k))/self.logit_softcap)
 			n=T-step+1
 			loss=loss+self.mtp_weight*F.cross_entropy(lk[:,:n].reshape(-1,V).float(),target_ids[:,step-1:step-1+n].reshape(-1),reduction='mean')
-		return loss
+		return loss,ar_loss
 def classify_param(name):
 	if'tok_emb'in name or'lm_head'in name:return'embed'
 	if'.mlp.'in name:return'mlp'
@@ -415,27 +415,27 @@ def train_model(h,device,val_data):
 		if frac>=1.-h.warmdown_frac:return max((1.-frac)/h.warmdown_frac,h.min_lr)
 		return 1.
 	def step_fn(step,lr_scale):
-		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device)
+		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device);ar_loss_total=torch.zeros((),device=device)
 		for micro_step in range(h.grad_accum_steps):
 			if h.distributed:model.require_backward_grad_sync=micro_step==h.grad_accum_steps-1
 			x,y=train_loader.next_batch(h.train_batch_tokens,h.grad_accum_steps)
-			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
-			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
-		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss,ar_loss=model(x,y)
+			train_loss+=loss.detach();ar_loss_total+=ar_loss.detach();(loss/h.grad_accum_steps).backward()
+		train_loss/=h.grad_accum_steps;ar_loss_total/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
 		for group in optimizers.optimizer_muon.param_groups:group['momentum']=muon_momentum
 		for opt in optimizers:
 			for group in opt.param_groups:group['lr']=group['base_lr']*lr_scale
 		if h.grad_clip_norm>0:torch.nn.utils.clip_grad_norm_(base_model.parameters(),h.grad_clip_norm)
-		optimizers.step();return train_loss
+		optimizers.step();return train_loss,ar_loss_total
 	if h.warmup_steps>0:
 		initial_model_state={name:tensor.detach().cpu().clone()for(name,tensor)in base_model.state_dict().items()};initial_optimizer_states=[copy.deepcopy(opt.state_dict())for opt in optimizers];model.train()
 		for warmup_step in range(h.warmup_steps):
-			step_fn(warmup_step,1.)
+			step_fn(warmup_step,1.)[0]
 			if warmup_step<=5 or(warmup_step+1)%10==0 or warmup_step+1==h.warmup_steps:log(f"warmup_step: {warmup_step+1}/{h.warmup_steps}")
 		if h.num_loops>0:
 			base_model.looping_active=True;log(f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 			for warmup_step in range(h.warmup_steps):
-				step_fn(warmup_step,1.)
+				step_fn(warmup_step,1.)[0]
 				if warmup_step<=5 or(warmup_step+1)%10==0 or warmup_step+1==h.warmup_steps:log(f"loop_warmup_step: {warmup_step+1}/{h.warmup_steps}")
 			base_model.looping_active=False
 		base_model.load_state_dict(initial_model_state,strict=True)
@@ -452,11 +452,11 @@ def train_model(h,device,val_data):
 			break
 		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac)
 		if h.num_loops>0 and not base_model.looping_active and frac>=h.enable_looping_at:base_model.looping_active=True;log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
-		train_loss=step_fn(step,scale)
+		train_loss,ar_loss_step=step_fn(step,scale)
 		with torch.no_grad():
 			for(name,t)in base_model.state_dict().items():ema_state[name].mul_(ema_decay).add_(t.detach().float(),alpha=1.-ema_decay)
 		step+=1;approx_training_time_ms=training_time_ms+1e3*(time.perf_counter()-t0);should_log_train=h.train_log_every>0 and(step<=5 or step%h.train_log_every==0 or stop_after_step is not None)
-		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}")
+		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} lm_loss: {ar_loss_step.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}")
 		reached_cap=max_wallclock_ms is not None and approx_training_time_ms>=max_wallclock_ms
 		if h.distributed and max_wallclock_ms is not None:reached_cap_tensor=torch.tensor(int(reached_cap),device=device);dist.all_reduce(reached_cap_tensor,op=dist.ReduceOp.MAX);reached_cap=bool(reached_cap_tensor.item())
 		if stop_after_step is None and reached_cap:stop_after_step=step
