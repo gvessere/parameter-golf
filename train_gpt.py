@@ -86,6 +86,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Multi-token prediction auxiliary loss.
+    mtp_depth = int(os.environ.get("MTP_DEPTH", 0))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.1))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -659,6 +663,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mtp_depth: int = 0,
+        mtp_loss_weight: float = 0.1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +672,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_depth = mtp_depth
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -712,16 +720,30 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        h = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(h, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(h)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if self.mtp_depth > 0 and self.training:
+            for k in range(1, self.mtp_depth + 1):
+                h_k = x[:, :-k, :].reshape(-1, x.size(-1))
+                t_k = target_ids[:, k:].reshape(-1)
+                if self.tie_embeddings:
+                    lp_k = F.linear(h_k, self.tok_emb.weight)
+                else:
+                    lp_k = self.lm_head(h_k)
+                lg_k = self.logit_softcap * torch.tanh(lp_k / self.logit_softcap)
+                loss = loss + self.mtp_loss_weight * F.cross_entropy(lg_k.float(), t_k, reduction="mean")
+
+        return loss
 
 
 # -----------------------------
@@ -835,6 +857,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mtp_depth=args.mtp_depth,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +932,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.mtp_depth > 0:
+        log0(f"mtp_depth:{args.mtp_depth} mtp_loss_weight:{args.mtp_loss_weight}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
