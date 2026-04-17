@@ -14,6 +14,7 @@ Then start the training session:
 
 ```
 cd /workspace/parameter-golf
+SKIP_QUANTIZATION=1 \
 MARS_WEIGHT=1.0 MARS_BLOCK_SIZE=4 \
 MULTI_STEP_WEIGHT=0.0 TOKEN_DROPOUT_RATE=0.0 \
 ITERATIONS=2000 MAX_WALLCLOCK_SECONDS=0 \
