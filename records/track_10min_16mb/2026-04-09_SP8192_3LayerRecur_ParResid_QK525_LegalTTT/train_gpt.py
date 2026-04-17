@@ -97,8 +97,16 @@ class CausalSelfAttention(nn.Module):
 		if self.head_dim%2!=0:raise ValueError('head_dim must be even for RoPE')
 		kv_dim=self.num_kv_heads*self.head_dim;self.c_q=CastedLinear(dim,dim,bias=False);self.c_k=CastedLinear(dim,kv_dim,bias=False);self.c_v=CastedLinear(dim,kv_dim,bias=False);self.proj=CastedLinear(dim,dim,bias=False);self.proj._zero_init=True;self.q_gain=nn.Parameter(torch.full((num_heads,),qk_gain_init,dtype=torch.float32));self.rope_dims=0;self.rotary=Rotary(self.head_dim,base=rope_base,train_seq_len=train_seq_len);self.use_xsa=False
 	def _xsa_efficient(self,y,v):B,T,H,D=y.shape;Hkv=v.size(-2);group=H//Hkv;y_g=y.reshape(B,T,Hkv,group,D);vn=F.normalize(v,dim=-1).unsqueeze(-2);proj=(y_g*vn).sum(dim=-1,keepdim=True)*vn;return(y_g-proj).reshape(B,T,H,D)
-	def forward(self,x):
-		bsz,seqlen,dim=x.shape;q=self.c_q(x).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);v=self.c_v(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);q=F.rms_norm(q,(q.size(-1),));k=F.rms_norm(k,(k.size(-1),));cos,sin=self.rotary(seqlen,x.device,q.dtype);q=apply_rotary_emb(q,cos,sin,self.rope_dims);k=apply_rotary_emb(k,cos,sin,self.rope_dims);q=q*self.q_gain.to(dtype=q.dtype)[None,None,:,None];y=flash_attn_3_func(q,k,v,causal=True)
+	def forward(self,x,key_padding_mask=None):
+		bsz,seqlen,dim=x.shape;q=self.c_q(x).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);v=self.c_v(x).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);q=F.rms_norm(q,(q.size(-1),));k=F.rms_norm(k,(k.size(-1),));cos,sin=self.rotary(seqlen,x.device,q.dtype);q=apply_rotary_emb(q,cos,sin,self.rope_dims);k=apply_rotary_emb(k,cos,sin,self.rope_dims);q=q*self.q_gain.to(dtype=q.dtype)[None,None,:,None]
+		if key_padding_mask is None:
+			y=flash_attn_3_func(q,k,v,causal=True)
+		else:
+			causal_bias=torch.full((seqlen,seqlen),float('-inf'),device=x.device,dtype=torch.float32).triu(1)
+			key_bias=torch.zeros(bsz,1,1,seqlen,device=x.device,dtype=torch.float32).masked_fill_(key_padding_mask.unsqueeze(1).unsqueeze(2),float('-inf'))
+			attn_bias=(causal_bias+key_bias).to(dtype=q.dtype)
+			g=self.num_heads//self.num_kv_heads;qt=q.transpose(1,2);kt=k.transpose(1,2).repeat_interleave(g,dim=1);vt=v.transpose(1,2).repeat_interleave(g,dim=1)
+			y=F.scaled_dot_product_attention(qt,kt,vt,attn_mask=attn_bias).transpose(1,2)
 		if self.use_xsa:y=self._xsa_efficient(y,v)
 		y=y.reshape(bsz,seqlen,dim);return self.proj(y)
 class MLP(nn.Module):
@@ -106,8 +114,8 @@ class MLP(nn.Module):
 	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.5).square())
 class Block(nn.Module):
 	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False):super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm();self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len);self.mlp=MLP(dim,mlp_mult);self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float());self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False
-	def forward(self,x,x0):
-		mix=self.resid_mix.to(dtype=x.dtype);x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0;attn_out=self.attn(self.attn_norm(x_in)*self.ln_scale_factor)
+	def forward(self,x,x0,key_padding_mask=None):
+		mix=self.resid_mix.to(dtype=x.dtype);x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0;attn_out=self.attn(self.attn_norm(x_in)*self.ln_scale_factor,key_padding_mask=key_padding_mask)
 		if self.parallel:mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor);x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
 		else:x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out;x_out=x_out+self.mlp_scale.to(dtype=x_out.dtype)[None,None,:]*self.mlp(self.mlp_norm(x_out)*self.ln_scale_factor)
 		return x_out
@@ -141,17 +149,17 @@ class GPT(nn.Module):
 			if isinstance(module,nn.Linear):
 				if getattr(module,'_zero_init',False):nn.init.zeros_(module.weight)
 				elif module.weight.ndim==2 and module.weight.shape[0]>=64 and module.weight.shape[1]>=64:nn.init.orthogonal_(module.weight,gain=1.)
-	def forward_logits(self,input_ids):
+	def forward_logits(self,input_ids,key_padding_mask=None):
 		x=self.tok_emb(input_ids);x=F.rms_norm(x,(x.size(-1),))
 		if self.embed_proj is not None:x=self.embed_proj(x)
 		x0=x;skips=[];enc_iter=self.encoder_indices if self.looping_active else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
-		for i in enc_iter:x=self.blocks[i](x,x0);skips.append(x)
+		for i in enc_iter:x=self.blocks[i](x,x0,key_padding_mask=key_padding_mask);skips.append(x)
 		for(skip_idx,i)in enumerate(dec_iter):
 			if skip_idx<self.num_skip_weights and skips:
 				scaled_skip=self.skip_weights[skip_idx].to(dtype=x.dtype)[None,None,:]*skips.pop()
 				if self.skip_gates is not None:g=torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None,None,:];x=torch.lerp(scaled_skip,x,g)
 				else:x=x+scaled_skip
-			x=self.blocks[i](x,x0)
+			x=self.blocks[i](x,x0,key_padding_mask=key_padding_mask)
 		x=self.final_norm(x)
 		if self.head_proj is not None:x=self.head_proj(x)
 		if self.tie_embeddings:logits_proj=F.linear(x,self.tok_emb.weight)
@@ -172,7 +180,7 @@ class GPT(nn.Module):
 			aux=self.multi_step_scale*aux
 		if self.mars_weight>0.:
 			bm=torch.rand(input_ids.shape,device=input_ids.device,dtype=torch.float32)<self.mars_mask_rate
-			noisy_ids=input_ids.masked_fill(bm,0);nlogits=self.forward_logits(noisy_ids)
+			nlogits=self.forward_logits(input_ids,key_padding_mask=bm)
 			flat_nlogits=nlogits.reshape(-1,V).float();flat_tgt=target_ids.reshape(-1)
 			bm_flat=bm.reshape(-1).float()
 			aux=aux+self.mars_weight*(F.cross_entropy(flat_nlogits,flat_tgt,reduction='none')*bm_flat).sum()/bm_flat.sum().clamp(min=1)
