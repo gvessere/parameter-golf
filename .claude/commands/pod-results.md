@@ -21,6 +21,15 @@ Steps:
    - final val loss (grep the last "val_loss:" line from train.log)
    - key hyperparameters (grep the hyperparams block from train.log)
 
-5. Print a summary: directory created, final val loss, git hash.
+5. Determine the baseline for comparison:
+   - Check if experiments/baseline points to an existing experiment directory (contains the path to the baseline)
+   - If no baseline file exists, list available experiments and ask the user which to use as baseline (or confirm there is none)
+   - Extract the baseline's final val loss from its train.log
 
-6. Offer to commit the new experiment directory to git.
+6. Write a conclusion in meta.md:
+   - If no baseline: "No baseline available for comparison."
+   - If baseline exists: state which experiment is the baseline, its val loss, the delta (e.g. "+0.012 worse" or "-0.008 better"), and a one-line verdict: "better", "worse", or "close" (within 0.005 = close)
+
+7. Print a summary: directory created, final val loss, comparison to baseline, git hash.
+
+8. Offer to commit the new experiment directory to git. Also ask if this run should become the new baseline (updates experiments/baseline).
