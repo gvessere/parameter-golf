@@ -17,7 +17,8 @@ cd /workspace/parameter-golf
 SKIP_QUANTIZATION=1 \
 MARS_WEIGHT=1.0 MARS_BLOCK_SIZE=4 \
 MULTI_STEP_WEIGHT=0.0 TOKEN_DROPOUT_RATE=0.0 \
-ITERATIONS=2000 MAX_WALLCLOCK_SECONDS=0 \
+ITERATIONS=2000 MAX_WALLCLOCK_SECONDS=99999 \
+VAL_LOSS_EVERY=500 \
 DATA_DIR=/workspace/parameter-golf/data \
 SEED=42 QK_GAIN_INIT=5.25 \
 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
@@ -26,3 +27,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee /workspace/trai
 ```
 
 After starting, wait 20 seconds and tail /workspace/train.log to verify the run started correctly. Confirm mars_weight and mars_block_size appear in the log.
+
+## Comparison target
+- **Quality**: pre-quantization val_loss target ~2.809 (8-GPU baseline mean, with batch size advantage)
+- **Throughput**: target ~120k tokens/s (baseline on 8×GPU). Current single-GPU throughput will be lower — note it from `tok/s` in the log. Optimize for throughput only after quality is validated.
