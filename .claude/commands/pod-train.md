@@ -7,7 +7,7 @@ Kill any existing tmux 'train' session, then run these steps before starting tra
 ```
 cd /workspace/parameter-golf
 git pull
-cp records/track_10min_16mb/2026-04-16_SP8192_3LayerRecur_ParResid_QK525_MultiToken/* /workspace/parameter-golf/
+cp records/track_10min_16mb/2026-04-17_SP8192_3LayerRecur_ParResid_QK525_ContrastiveDoc/* /workspace/parameter-golf/
 ```
 
 Then start the training session with the fixed infrastructure params plus the experiment-specific env vars from $ARGUMENTS:

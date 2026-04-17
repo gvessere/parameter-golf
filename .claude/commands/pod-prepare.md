@@ -9,7 +9,7 @@ Steps to run via SSH (ssh -i ~/.ssh/id_runpod -o StrictHostKeyChecking=no root@<
    - git init
    - git remote add origin https://github.com/gvessere/parameter-golf.git
 
-2. git fetch origin multi-token && git checkout -f multi-token && git pull
+2. git fetch origin contrastive-doc && git checkout -f contrastive-doc && git pull
 
 3. pip install -r requirements.txt --break-system-packages -q
 
@@ -20,6 +20,6 @@ Steps to run via SSH (ssh -i ~/.ssh/id_runpod -o StrictHostKeyChecking=no root@<
 6. If data not present (check /workspace/parameter-golf/data/datasets/fineweb10B_sp8192/):
    cd /workspace/parameter-golf && MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fineweb.py --variant sp8192
 
-7. cp records/track_10min_16mb/2026-04-16_SP8192_3LayerRecur_ParResid_QK525_MultiToken/* /workspace/parameter-golf/
+7. cp records/track_10min_16mb/2026-04-17_SP8192_3LayerRecur_ParResid_QK525_ContrastiveDoc/* /workspace/parameter-golf/
 
 Print status after each step. Pod is ready when all steps complete.
