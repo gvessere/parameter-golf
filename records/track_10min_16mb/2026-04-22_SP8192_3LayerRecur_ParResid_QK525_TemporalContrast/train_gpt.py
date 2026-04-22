@@ -160,6 +160,8 @@ class GPT(nn.Module):
 		NB=B*N;labels=torch.arange(NB,device=x.device)
 		sim_fwd=(anchors@pos_fwd.T)/self.tc_temp
 		sim_bwd=(anchors@pos_bwd.T)/self.tc_temp
+		if self.tc_mode=='causal_fwd':return F.cross_entropy(sim_fwd,labels)
+		if self.tc_mode=='causal_bwd':return F.cross_entropy(sim_bwd,labels)
 		loss_fwd=(F.cross_entropy(sim_fwd,labels)+F.cross_entropy(sim_fwd.T,labels))/2
 		loss_bwd=(F.cross_entropy(sim_bwd,labels)+F.cross_entropy(sim_bwd.T,labels))/2
 		return(loss_fwd+loss_bwd)/2
