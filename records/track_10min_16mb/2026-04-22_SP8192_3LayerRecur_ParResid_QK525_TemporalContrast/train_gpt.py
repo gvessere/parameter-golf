@@ -149,14 +149,15 @@ class GPT(nn.Module):
 		if self.tc_mode=='repulsive':
 			h=F.normalize(x_f,dim=-1)
 			return(h[:,:-1]*h[:,1:]).sum(dim=-1).mean()
-		N=self.tc_n_pairs;anchors=[];pos_fwd=[];pos_bwd=[]
-		for b in range(B):
-			t=torch.randperm(T-2,device=x.device)[:N]+1
-			anchors.append(x_f[b,t]);pos_fwd.append(x_f[b,t+1]);pos_bwd.append(x_f[b,t-1])
-		anchors=F.normalize(torch.cat(anchors,0),dim=-1)
-		pos_fwd=F.normalize(torch.cat(pos_fwd,0),dim=-1)
-		pos_bwd=F.normalize(torch.cat(pos_bwd,0),dim=-1)
-		NB=anchors.shape[0];labels=torch.arange(NB,device=x.device)
+		N=self.tc_n_pairs
+		# Vectorized random sampling: topk on uniform noise gives random positions without Python loop
+		noise=torch.rand(B,T-2,device=x.device)
+		t_all=noise.topk(N,dim=1).indices+1  # (B,N) positions in [1,T-2]
+		b_idx=torch.arange(B,device=x.device).unsqueeze(1).expand(B,N)
+		anchors=F.normalize(x_f[b_idx,t_all].reshape(B*N,D),dim=-1)
+		pos_fwd=F.normalize(x_f[b_idx,t_all+1].reshape(B*N,D),dim=-1)
+		pos_bwd=F.normalize(x_f[b_idx,t_all-1].reshape(B*N,D),dim=-1)
+		NB=B*N;labels=torch.arange(NB,device=x.device)
 		sim_fwd=(anchors@pos_fwd.T)/self.tc_temp
 		sim_bwd=(anchors@pos_bwd.T)/self.tc_temp
 		loss_fwd=(F.cross_entropy(sim_fwd,labels)+F.cross_entropy(sim_fwd.T,labels))/2
