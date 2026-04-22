@@ -141,7 +141,6 @@ class GPT(nn.Module):
 			if isinstance(module,nn.Linear):
 				if getattr(module,'_zero_init',False):nn.init.zeros_(module.weight)
 				elif module.weight.ndim==2 and module.weight.shape[0]>=64 and module.weight.shape[1]>=64:nn.init.orthogonal_(module.weight,gain=1.)
-	@torch._dynamo.disable
 	def _temporal_contrast_loss(self,x):
 		# x: [B,T,D] hidden states
 		# attractive: InfoNCE pulling h_t toward h_{t+1} and h_{t-1}
@@ -414,7 +413,7 @@ def eval_val_ttt(h,device,val_data,base_model,batch_seqs=32):
 	base_model.eval();return _loss_bpb(loss_sum,token_count,byte_count)
 def timed_eval(label,fn,*args,**kwargs):torch.cuda.synchronize();t0=time.perf_counter();val_loss,val_bpb=fn(*args,**kwargs);torch.cuda.synchronize();elapsed_ms=1e3*(time.perf_counter()-t0);log(f"{label} val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f} eval_time:{elapsed_ms:.0f}ms");return val_loss,val_bpb
 def train_model(h,device,val_data):
-	base_model=GPT(h).to(device).bfloat16();restore_fp32_params(base_model);compiled_model=torch.compile(base_model,dynamic=False,fullgraph=h.tc_weight==0.)
+	base_model=GPT(h).to(device).bfloat16();restore_fp32_params(base_model);compiled_model=torch.compile(base_model,dynamic=False,fullgraph=True)
 	if h.distributed:model=DDP(compiled_model,device_ids=[h.local_rank],broadcast_buffers=False)
 	else:model=compiled_model
 	log(f"model_params:{sum(p.numel()for p in base_model.parameters())}");optimizers=Optimizers(h,base_model);train_loader=ShuffledSequenceLoader(h,device);max_wallclock_ms=1e3*h.max_wallclock_seconds if h.max_wallclock_seconds>0 else None
