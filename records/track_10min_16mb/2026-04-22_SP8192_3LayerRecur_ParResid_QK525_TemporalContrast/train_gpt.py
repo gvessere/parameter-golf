@@ -165,18 +165,18 @@ class GPT(nn.Module):
 	def _forward_hidden(self,input_ids):
 		x=self.tok_emb(input_ids);x=F.rms_norm(x,(x.size(-1),))
 		if self.embed_proj is not None:x=self.embed_proj(x)
-		x0=x;skips=[];loop_last_x=x;enc_iter=self.encoder_indices if self.looping_active else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
+		x0=x;skips=[];loop_tc_loss=None;do_loop_tc=self.training and self.tc_weight>0. and self.tc_layer=='loop_end';enc_iter=self.encoder_indices if self.looping_active else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
 		for i in enc_iter:
 			x=self.blocks[i](x,x0);skips.append(x)
-			if i==self.loop_end_idx:loop_last_x=x
+			if do_loop_tc and i==self.loop_end_idx:loop_tc_loss=self._temporal_contrast_loss(x)
 		for(skip_idx,i)in enumerate(dec_iter):
 			if skip_idx<self.num_skip_weights and skips:
 				scaled_skip=self.skip_weights[skip_idx].to(dtype=x.dtype)[None,None,:]*skips.pop()
 				if self.skip_gates is not None:g=torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None,None,:];x=torch.lerp(scaled_skip,x,g)
 				else:x=x+scaled_skip
 			x=self.blocks[i](x,x0)
-			if i==self.loop_end_idx:loop_last_x=x
-		return x,loop_last_x
+			if do_loop_tc and i==self.loop_end_idx:loop_tc_loss=self._temporal_contrast_loss(x)
+		return x,loop_tc_loss
 	def forward_logits(self,input_ids):
 		x,_=self._forward_hidden(input_ids);x=self.final_norm(x)
 		if self.head_proj is not None:x=self.head_proj(x)
@@ -186,13 +186,13 @@ class GPT(nn.Module):
 	def forward(self,input_ids,target_ids):
 		if not self.training or self.tc_weight==0.:
 			logits=self.forward_logits(input_ids);ar_loss=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),target_ids.reshape(-1),reduction='mean');return ar_loss,ar_loss
-		x,loop_last_x=self._forward_hidden(input_ids);B,T,D=x.shape;V=self.tok_emb.weight.size(0)
+		x,loop_tc_loss=self._forward_hidden(input_ids);B,T,D=x.shape;V=self.tok_emb.weight.size(0)
 		x_ar=self.final_norm(x)
 		if self.head_proj is not None:x_ar=self.head_proj(x_ar)
 		ar_logits=self.logit_softcap*torch.tanh((F.linear(x_ar,self.tok_emb.weight)if self.tie_embeddings else self.lm_head(x_ar))/self.logit_softcap)
 		ar_loss=F.cross_entropy(ar_logits.reshape(-1,V).float(),target_ids.reshape(-1),reduction='mean');loss=ar_loss
-		tc_x=loop_last_x if self.tc_layer=='loop_end' else x_ar
-		loss=loss+self.tc_weight*self._temporal_contrast_loss(tc_x)
+		if loop_tc_loss is not None:loss=loss+self.tc_weight*loop_tc_loss
+		elif self.tc_layer=='pre_logits':loss=loss+self.tc_weight*self._temporal_contrast_loss(x_ar)
 		return loss,ar_loss
 def classify_param(name):
 	if'tok_emb'in name or'lm_head'in name:return'embed'
