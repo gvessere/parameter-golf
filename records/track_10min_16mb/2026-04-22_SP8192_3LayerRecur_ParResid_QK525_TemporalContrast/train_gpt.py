@@ -420,9 +420,8 @@ def train_model(h,device,val_data):
 	log(f"model_params:{sum(p.numel()for p in base_model.parameters())}");optimizers=Optimizers(h,base_model);train_loader=ShuffledSequenceLoader(h,device);max_wallclock_ms=1e3*h.max_wallclock_seconds if h.max_wallclock_seconds>0 else None
 	if max_wallclock_ms is not None:max_wallclock_ms-=h.gptq_reserve_seconds*1e3;log(f"gptq:reserving {h.gptq_reserve_seconds:.0f}s, effective={max_wallclock_ms:.0f}ms")
 	def training_frac(step,elapsed_ms):
-		frac_step=step/max(h.iterations,1)
-		if max_wallclock_ms is None:return frac_step
-		return max(frac_step,elapsed_ms/max(max_wallclock_ms,1e-09))
+		if max_wallclock_ms is None:return step/max(h.iterations,1)
+		return elapsed_ms/max(max_wallclock_ms,1e-09)
 	def lr_mul(frac):
 		if h.warmdown_frac<=0:return 1.
 		if frac>=1.-h.warmdown_frac:return max((1.-frac)/h.warmdown_frac,h.min_lr)
