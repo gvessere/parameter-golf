@@ -171,22 +171,24 @@ class GPT(nn.Module):
 		loss_bwd=(F.cross_entropy(sim_bwd,labels)+F.cross_entropy(sim_bwd.T,labels))/2
 		return(loss_fwd+loss_bwd)/2
 	def _mtp_loss(self,x,target_ids):
-		B,T,D=x.shape;V=self.tok_emb.weight.size(0);losses=[]
+		# Each head k conditions on the ground truth token at horizon k (teacher forcing),
+		# then predicts the token at horizon k+1. Heads are chained: h_prev -> head_k(h_prev + embed(gt_k)) -> h_k
+		B,T,D=x.shape;V=self.tok_emb.weight.size(0);losses=[];h_prev=x
 		def get_logits(h):
 			h=self.final_norm(h)
 			if self.head_proj is not None:h=self.head_proj(h)
 			return self.logit_softcap*torch.tanh((F.linear(h,self.tok_emb.weight)if self.tie_embeddings else self.lm_head(h))/self.logit_softcap)
-		if self.mtp_type=='mlp':
-			for k in range(self.mtp_horizons):
-				h=F.gelu(self.mtp_heads[k](x[:,: T-k-1].float()))
-				logits=get_logits(h);tgt=target_ids[:,k+1:]
-				losses.append(F.cross_entropy(logits.reshape(-1,V).float(),tgt.reshape(-1)))
-		else:
-			h_curr=x.float()
-			for k in range(self.mtp_horizons):
-				h_curr=self.mtp_block(h_curr,x.float())
-				logits=get_logits(h_curr[:,: T-k-1])
-				losses.append(F.cross_entropy(logits.reshape(-1,V).float(),target_ids[:,k+1:].reshape(-1)))
+		for k in range(self.mtp_horizons):
+			T_k=T-k-1  # valid positions: t in [0, T_k-1]
+			# Condition on ground truth token at horizon k (= target_ids[t+k]) via shared tok_emb
+			cond=self.tok_emb(target_ids[:,k:k+T_k]).float()
+			if self.embed_proj is not None:cond=self.embed_proj(cond)
+			h_in=h_prev[:,:T_k].float()+cond
+			if self.mtp_type=='mlp':h_k=F.gelu(self.mtp_heads[k](h_in))
+			else:h_k=self.mtp_block(h_in,x[:,:T_k].float())
+			# Predict target_ids[t+k+1] for t in [0, T_k-1]
+			losses.append(F.cross_entropy(get_logits(h_k).reshape(-1,V).float(),target_ids[:,k+1:k+1+T_k].reshape(-1)))
+			h_prev=h_k
 		return sum(losses)/len(losses)
 	def _forward_hidden(self,input_ids):
 		x=self.tok_emb(input_ids);x=F.rms_norm(x,(x.size(-1),))
