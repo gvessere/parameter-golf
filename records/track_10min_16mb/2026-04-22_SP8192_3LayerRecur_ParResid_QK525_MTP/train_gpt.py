@@ -181,7 +181,7 @@ class GPT(nn.Module):
 		for k in range(self.mtp_horizons):
 			T_k=T-k-1  # valid positions: t in [0, T_k-1]
 			# Condition on ground truth token at horizon k (= target_ids[t+k]) via shared tok_emb
-			cond=self.tok_emb(target_ids[:,k:k+T_k]).float()
+			cond=self.tok_emb(target_ids[:,k:k+T_k]).float();cond=F.rms_norm(cond,(cond.size(-1),))
 			if self.embed_proj is not None:cond=self.embed_proj(cond)
 			h_in=h_prev[:,:T_k].float()+cond
 			if self.mtp_type=='mlp':h_k=F.gelu(self.mtp_heads[k](h_in))
